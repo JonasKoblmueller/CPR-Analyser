@@ -25,6 +25,10 @@ with st.sidebar:
 
 video_ph = st.empty()
 metrics_col1, metrics_col2, metrics_col3, metrics_col4 = st.columns(4)
+cpm_ph = metrics_col1.empty()
+reg_ph = metrics_col2.empty()
+comp_ph = metrics_col3.empty()
+vent_ph = metrics_col4.empty()
 status_ph = st.empty()
 
 if source == "Lokales Video":
@@ -58,10 +62,10 @@ if source == "Lokales Video":
                 frame_out, metrics = analyzer.process_frame(frame, t_sec)
 
                 video_ph.image(cv2.cvtColor(frame_out, cv2.COLOR_BGR2RGB), channels="RGB")
-                metrics_col1.metric("CPM", "--" if metrics.cpm is None else f"{metrics.cpm:.1f}")
-                metrics_col2.metric("Regelmäßigkeit", "--" if metrics.regularity is None else f"{metrics.regularity:.2f}")
-                metrics_col3.metric("Kompressionen", metrics.compression_count)
-                metrics_col4.metric("Beatmungen", metrics.ventilation_count)
+                cpm_ph.metric("CPM", "--" if metrics.cpm is None else f"{metrics.cpm:.1f}")
+                reg_ph.metric("Regelmäßigkeit", "--" if metrics.regularity is None else f"{metrics.regularity:.2f}")
+                comp_ph.metric("Kompressionen", metrics.compression_count)
+                vent_ph.metric("Beatmungen", metrics.ventilation_count)
                 status_ph.caption(
                     f"Rate-Qualität: {metrics.compression_quality} | Haltung: {metrics.posture_label}"
                     f" ({'--' if metrics.posture_score is None else f'{metrics.posture_score:.2f}'}) | 30:2-Score:"
@@ -107,10 +111,10 @@ else:
                 frame_out, metrics = analyzer.process_frame(frame, t_sec)
 
                 video_ph.image(cv2.cvtColor(frame_out, cv2.COLOR_BGR2RGB), channels="RGB")
-                metrics_col1.metric("CPM", "--" if metrics.cpm is None else f"{metrics.cpm:.1f}")
-                metrics_col2.metric("Regelmäßigkeit", "--" if metrics.regularity is None else f"{metrics.regularity:.2f}")
-                metrics_col3.metric("Kompressionen", metrics.compression_count)
-                metrics_col4.metric("Beatmungen", metrics.ventilation_count)
+                cpm_ph.metric("CPM", "--" if metrics.cpm is None else f"{metrics.cpm:.1f}")
+                reg_ph.metric("Regelmäßigkeit", "--" if metrics.regularity is None else f"{metrics.regularity:.2f}")
+                comp_ph.metric("Kompressionen", metrics.compression_count)
+                vent_ph.metric("Beatmungen", metrics.ventilation_count)
                 status_ph.caption(
                     f"Rate-Qualität: {metrics.compression_quality} | Haltung: {metrics.posture_label}"
                     f" ({'--' if metrics.posture_score is None else f'{metrics.posture_score:.2f}'}) | 30:2-Score:"
