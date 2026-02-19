@@ -24,6 +24,15 @@ class CPRMetrics:
 
 
 class CPRAnalyzer:
+    """Führt die CPR-Analyse auf Frame-Basis durch.
+
+    Pipeline:
+    1) Handgelenk-Tracking (MediaPipe Hands)
+    2) Signalaufbereitung (Interpolation, Bandpass, Glättung)
+    3) Peak-Detektion -> CPM + Kompressionszählung + Regelmäßigkeit
+    4) Heuristische Beatmungszählung
+    5) Pose-basierte Haltungsbewertung
+    """
     def __init__(
         self,
         fps: float,
@@ -72,6 +81,7 @@ class CPRAnalyzer:
         self.pose.close()
 
     def _bandpass_filter(self, signal: np.ndarray) -> np.ndarray:
+        """Bandpass im CPR-Bereich (typisch ~1.0 bis 2.5 Hz)."""
         nyq = 0.5 * self.fps
         low = max(self.bp_low / nyq, 1e-4)
         high = min(self.bp_high / nyq, 0.999)
@@ -93,6 +103,7 @@ class CPRAnalyzer:
         return np.degrees(np.arccos(cosang))
 
     def _posture_from_pose(self, pose_landmarks) -> Tuple[Optional[float], str]:
+        """Heuristische Haltungsauswertung (Arme gestreckt + Schultern über Händen)."""
         if pose_landmarks is None:
             return None, "no-pose"
 
@@ -125,6 +136,7 @@ class CPRAnalyzer:
 
 
     def process_frame(self, frame: np.ndarray, t_sec: float) -> tuple[np.ndarray, CPRMetrics]:
+        """Verarbeitet ein einzelnes Frame und liefert annotiertes Frame + aktuelle Metriken."""
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         hand_result = self.hands.process(rgb)
         pose_result = self.pose.process(rgb)
