@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""Core CPR analysis logic.
+
+This module contains a frame-by-frame analyzer that tracks wrist motion and pose,
+then estimates CPR quality metrics such as compression rate (CPM), regularity,
+counts, and simple posture quality.
+"""
+
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -13,6 +20,8 @@ from cpr_analyser.metrics import rate_quality_label, ratio_score_30_2
 
 @dataclass
 class CPRMetrics:
+    """Output metrics for one processed frame."""
+
     cpm: Optional[float] = None
     regularity: Optional[float] = None
     compression_count: int = 0
@@ -21,18 +30,23 @@ class CPRMetrics:
     posture_score: Optional[float] = None
     posture_label: str = "unknown"
     ratio_30_2_score: Optional[float] = None
+    # True when a likely ventilation pause is detected.
+    in_ventilation_pause: bool = False
+    # Latest filtered wrist-motion sample (for plotting).
+    signal_value: Optional[float] = None
 
 
 class CPRAnalyzer:
-    """Führt die CPR-Analyse auf Frame-Basis durch.
+    """Frame-based CPR analyzer using MediaPipe Hands + Pose.
 
     Pipeline:
-    1) Handgelenk-Tracking (MediaPipe Hands)
-    2) Signalaufbereitung (Interpolation, Bandpass, Glättung)
-    3) Peak-Detektion -> CPM + Kompressionszählung + Regelmäßigkeit
-    4) Heuristische Beatmungszählung
-    5) Pose-basierte Haltungsbewertung
+    1. Track wrist landmarks (hands) and body posture (pose).
+    2. Build a wrist-motion time signal.
+    3. Apply interpolation, bandpass filtering, smoothing.
+    4. Detect peaks to estimate CPM, regularity, and compression count.
+    5. Detect likely ventilation pauses heuristically.
     """
+
     def __init__(
         self,
         fps: float,
@@ -43,6 +57,7 @@ class CPRAnalyzer:
         bp_low: float = 1.0,
         bp_high: float = 2.5,
         bp_order: int = 3,
+        ventilation_pause_sec: float = 0.8,
     ) -> None:
         self.fps = fps if fps > 0 else 30.0
         self.live_window_sec = live_window_sec
@@ -52,11 +67,13 @@ class CPRAnalyzer:
         self.bp_low = bp_low
         self.bp_high = bp_high
         self.bp_order = bp_order
+        self.ventilation_pause_sec = ventilation_pause_sec
 
         self.mp_hands = mp.solutions.hands
         self.mp_pose = mp.solutions.pose
         self.mp_draw = mp.solutions.drawing_utils
 
+        # Low-complexity models for better realtime behavior.
         self.hands = self.mp_hands.Hands(
             static_image_mode=False,
             max_num_hands=2,
@@ -71,17 +88,21 @@ class CPRAnalyzer:
             min_tracking_confidence=0.6,
         )
 
+        # Time-series buffers.
         self.y_positions: list[float] = []
         self.timestamps: list[float] = []
+
+        # Global event timestamps.
         self.peak_times_global: list[float] = []
         self.vent_times: list[float] = []
 
     def close(self) -> None:
+        """Release MediaPipe resources."""
         self.hands.close()
         self.pose.close()
 
     def _bandpass_filter(self, signal: np.ndarray) -> np.ndarray:
-        """Bandpass im CPR-Bereich (typisch ~1.0 bis 2.5 Hz)."""
+        """Bandpass in CPR frequency range (roughly 1.0–2.5 Hz)."""
         nyq = 0.5 * self.fps
         low = max(self.bp_low / nyq, 1e-4)
         high = min(self.bp_high / nyq, 0.999)
@@ -94,33 +115,28 @@ class CPRAnalyzer:
 
     @staticmethod
     def _angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+        """Return angle ABC in degrees."""
         ab = a - b
         cb = c - b
-        denom = (np.linalg.norm(ab) * np.linalg.norm(cb))
+        denom = np.linalg.norm(ab) * np.linalg.norm(cb)
         if denom == 0:
             return 0.0
         cosang = np.clip(np.dot(ab, cb) / denom, -1.0, 1.0)
-        return np.degrees(np.arccos(cosang))
+        return float(np.degrees(np.arccos(cosang)))
 
     def _posture_from_pose(self, pose_landmarks) -> Tuple[Optional[float], str]:
-        """Heuristische Haltungsauswertung (Arme gestreckt + Schultern über Händen)."""
+        """Simple posture heuristic using elbows, shoulders, and wrists."""
         if pose_landmarks is None:
             return None, "no-pose"
 
         lm = pose_landmarks.landmark
-        ls = np.array([lm[self.mp_pose.PoseLandmark.LEFT_SHOULDER].x,
-                       lm[self.mp_pose.PoseLandmark.LEFT_SHOULDER].y])
-        le = np.array([lm[self.mp_pose.PoseLandmark.LEFT_ELBOW].x,
-                       lm[self.mp_pose.PoseLandmark.LEFT_ELBOW].y])
-        lw = np.array([lm[self.mp_pose.PoseLandmark.LEFT_WRIST].x,
-                       lm[self.mp_pose.PoseLandmark.LEFT_WRIST].y])
+        ls = np.array([lm[self.mp_pose.PoseLandmark.LEFT_SHOULDER].x, lm[self.mp_pose.PoseLandmark.LEFT_SHOULDER].y])
+        le = np.array([lm[self.mp_pose.PoseLandmark.LEFT_ELBOW].x, lm[self.mp_pose.PoseLandmark.LEFT_ELBOW].y])
+        lw = np.array([lm[self.mp_pose.PoseLandmark.LEFT_WRIST].x, lm[self.mp_pose.PoseLandmark.LEFT_WRIST].y])
 
-        rs = np.array([lm[self.mp_pose.PoseLandmark.RIGHT_SHOULDER].x,
-                       lm[self.mp_pose.PoseLandmark.RIGHT_SHOULDER].y])
-        re = np.array([lm[self.mp_pose.PoseLandmark.RIGHT_ELBOW].x,
-                       lm[self.mp_pose.PoseLandmark.RIGHT_ELBOW].y])
-        rw = np.array([lm[self.mp_pose.PoseLandmark.RIGHT_WRIST].x,
-                       lm[self.mp_pose.PoseLandmark.RIGHT_WRIST].y])
+        rs = np.array([lm[self.mp_pose.PoseLandmark.RIGHT_SHOULDER].x, lm[self.mp_pose.PoseLandmark.RIGHT_SHOULDER].y])
+        re = np.array([lm[self.mp_pose.PoseLandmark.RIGHT_ELBOW].x, lm[self.mp_pose.PoseLandmark.RIGHT_ELBOW].y])
+        rw = np.array([lm[self.mp_pose.PoseLandmark.RIGHT_WRIST].x, lm[self.mp_pose.PoseLandmark.RIGHT_WRIST].y])
 
         left_angle = self._angle(ls, le, lw)
         right_angle = self._angle(rs, re, rw)
@@ -134,9 +150,8 @@ class CPRAnalyzer:
         label = "good" if score >= 0.65 else "improve"
         return float(score), label
 
-
     def process_frame(self, frame: np.ndarray, t_sec: float) -> tuple[np.ndarray, CPRMetrics]:
-        """Verarbeitet ein einzelnes Frame und liefert annotiertes Frame + aktuelle Metriken."""
+        """Process one frame and return annotated frame + metrics."""
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         hand_result = self.hands.process(rgb)
         pose_result = self.pose.process(rgb)
@@ -144,6 +159,7 @@ class CPRAnalyzer:
         wrist_y = np.nan
         wrist_px = None
 
+        # Draw hands and capture wrist y-position.
         if hand_result.multi_hand_landmarks:
             ys = []
             pxs = []
@@ -168,6 +184,7 @@ class CPRAnalyzer:
         cpm: Optional[float] = None
         regularity: Optional[float] = None
         is_peak = False
+        signal_value: Optional[float] = None
 
         if np.sum(valid) > self.fps:
             y_interp = np.interp(t_arr, t_arr[valid], y_arr[valid])
@@ -179,6 +196,8 @@ class CPRAnalyzer:
             mask = t_arr > (t_arr[-1] - self.live_window_sec)
             t_live = t_arr[mask]
             s_live = signal[mask]
+            if len(s_live) > 0:
+                signal_value = float(s_live[-1])
 
             min_dist = int(self.min_peak_distance_sec * self.fps)
             peaks, _ = find_peaks(s_live, distance=max(min_dist, 1), prominence=self.prominence)
@@ -187,6 +206,7 @@ class CPRAnalyzer:
                 duration = t_live[peaks[-1]] - t_live[peaks[0]]
                 if duration > 0:
                     cpm = float((len(peaks) - 1) / duration * 60.0)
+
                 intervals = np.diff(t_live[peaks])
                 if len(intervals) > 0 and np.mean(intervals) > 0:
                     regularity = float(max(0.0, 1.0 - (np.std(intervals) / np.mean(intervals))))
@@ -203,13 +223,23 @@ class CPRAnalyzer:
             for tr in troughs:
                 tt = float(t_live[tr])
                 if not self.vent_times or tt - self.vent_times[-1] > 1.0:
-                    # Heuristik: längere Pause seit letzter Kompression als Beatmungskandidat
-                    if self.peak_times_global and (tt - self.peak_times_global[-1] > 0.8):
+                    if self.peak_times_global and (tt - self.peak_times_global[-1] > self.ventilation_pause_sec):
                         self.vent_times.append(tt)
 
         posture_score, posture_label = self._posture_from_pose(pose_result.pose_landmarks)
         compression_count = len(self.peak_times_global)
         ventilation_count = len(self.vent_times)
+
+        # Pause detection: if no recent compression, likely ventilation break.
+        in_ventilation_pause = False
+        if self.peak_times_global:
+            in_ventilation_pause = (t_sec - self.peak_times_global[-1]) > self.ventilation_pause_sec
+
+        # During ventilation pause, suppress CPM + regularity output.
+        if in_ventilation_pause:
+            cpm = None
+            regularity = None
+            signal_value = None
 
         if is_peak and wrist_px is not None:
             cv2.circle(frame, wrist_px, 10, (0, 255, 0), -1)
@@ -223,5 +253,7 @@ class CPRAnalyzer:
             posture_score=posture_score,
             posture_label=posture_label,
             ratio_30_2_score=ratio_score_30_2(compression_count, ventilation_count),
+            in_ventilation_pause=in_ventilation_pause,
+            signal_value=signal_value,
         )
         return frame, metrics
