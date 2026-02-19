@@ -25,6 +25,7 @@ with st.sidebar:
 
 video_ph = st.empty()
 metrics_col1, metrics_col2, metrics_col3, metrics_col4 = st.columns(4)
+status_ph = st.empty()
 
 if source == "Lokales Video":
     upload = st.file_uploader("Video hochladen", type=["mp4", "mov", "avi", "mkv"])
@@ -61,7 +62,7 @@ if source == "Lokales Video":
                 metrics_col2.metric("Regelmäßigkeit", "--" if metrics.regularity is None else f"{metrics.regularity:.2f}")
                 metrics_col3.metric("Kompressionen", metrics.compression_count)
                 metrics_col4.metric("Beatmungen", metrics.ventilation_count)
-                st.caption(
+                status_ph.caption(
                     f"Rate-Qualität: {metrics.compression_quality} | Haltung: {metrics.posture_label}"
                     f" ({'--' if metrics.posture_score is None else f'{metrics.posture_score:.2f}'}) | 30:2-Score:"
                     f" {'--' if metrics.ratio_30_2_score is None else f'{metrics.ratio_30_2_score:.2f}'}"
@@ -110,7 +111,7 @@ else:
                 metrics_col2.metric("Regelmäßigkeit", "--" if metrics.regularity is None else f"{metrics.regularity:.2f}")
                 metrics_col3.metric("Kompressionen", metrics.compression_count)
                 metrics_col4.metric("Beatmungen", metrics.ventilation_count)
-                st.caption(
+                status_ph.caption(
                     f"Rate-Qualität: {metrics.compression_quality} | Haltung: {metrics.posture_label}"
                     f" ({'--' if metrics.posture_score is None else f'{metrics.posture_score:.2f}'}) | 30:2-Score:"
                     f" {'--' if metrics.ratio_30_2_score is None else f'{metrics.ratio_30_2_score:.2f}'}"
