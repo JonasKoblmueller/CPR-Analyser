@@ -224,3 +224,4 @@ else:
             cap.release()
             if st.session_state.live_stop:
                 st.info("Live-Analyse gestoppt")
+
