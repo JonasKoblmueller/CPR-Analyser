@@ -3,7 +3,7 @@ from __future__ import annotations
 """Core CPR analysis logic."""
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import cv2
 import mediapipe as mp
@@ -11,6 +11,9 @@ import numpy as np
 from scipy.signal import butter, filtfilt, find_peaks
 
 from cpr_analyser.metrics import rate_quality_label, ratio_score_30_2
+
+HandSignalMode = Literal["palm", "wrist", "hybrid"]
+_PALM_INDICES = np.array([0, 5, 9, 13, 17], dtype=int)
 
 
 @dataclass
@@ -27,10 +30,22 @@ class CPRMetrics:
     ratio_30_2_score: Optional[float] = None
     in_ventilation_pause: bool = False
     signal_value: Optional[float] = None
+    sample_fps_est: Optional[float] = None
+    valid_intervals: int = 0
+    signal_confidence: Optional[float] = None
+    hold_age_ms: Optional[float] = None
+
+
+@dataclass
+class _HandCandidate:
+    signal_y: float
+    anchor_px: tuple[int, int]
+    anchor_norm: tuple[float, float]
+    track_points_px: np.ndarray
 
 
 class CPRAnalyzer:
-    """Frame-based CPR analyzer using MediaPipe Hands + Pose."""
+    """Frame-based CPR analyzer using MediaPipe Hands + optional Pose."""
 
     def __init__(
         self,
@@ -39,13 +54,17 @@ class CPRAnalyzer:
         min_peak_distance_sec: float = 0.35,
         prominence: float = 0.003,
         smoothing_window: int = 5,
-        bp_low: float = 1.0,
-        bp_high: float = 2.5,
+        bp_low: float = 20.0 / 60.0,
+        bp_high: float = 170.0 / 60.0,
         bp_order: int = 3,
         ventilation_pause_sec: float = 0.8,
         min_valid_cpm: float = 20.0,
         max_valid_cpm: float = 170.0,
         enable_ventilation_detection: bool = False,
+        enable_pose: bool = False,
+        pose_every_n: int = 3,
+        hand_signal_mode: str = "palm",
+        display_debug: bool = False,
     ) -> None:
         self.fps = fps if fps > 0 else 30.0
         self.live_window_sec = live_window_sec
@@ -59,19 +78,25 @@ class CPRAnalyzer:
         self.min_valid_cpm = min_valid_cpm
         self.max_valid_cpm = max_valid_cpm
         self.enable_ventilation_detection = enable_ventilation_detection
+        self.enable_pose = enable_pose
+        self.pose_every_n = max(1, int(pose_every_n))
+        self.display_debug = display_debug
+
+        mode = hand_signal_mode.strip().lower()
+        self.hand_signal_mode: HandSignalMode = "palm" if mode not in {"palm", "wrist", "hybrid"} else mode
 
         self.max_hist_sec = live_window_sec + 2.0
         self.max_hist_samples = max(1, int(self.max_hist_sec * self.fps))
-        self.pose_every_n = 2
         self.frame_counter = 0
 
         self.prev_gray: Optional[np.ndarray] = None
-        self.prev_wrist_point: Optional[np.ndarray] = None
-        self.tracked_wrist_y: Optional[float] = None
+        self.prev_track_points: Optional[np.ndarray] = None
+        self.tracked_signal_y: Optional[float] = None
 
         self.last_valid_cpm: Optional[float] = None
         self.last_valid_regularity: Optional[float] = None
         self.last_valid_t: Optional[float] = None
+        self.last_hold_age_ms: Optional[float] = None
         self.cpm_hold_sec = 1.5
 
         self._last_pose_landmarks = None
@@ -106,6 +131,20 @@ class CPRAnalyzer:
         self.pose.close()
 
     @staticmethod
+    def _robust_mean(values: np.ndarray) -> float:
+        values = np.asarray(values, dtype=float)
+        if len(values) == 0:
+            return float("nan")
+        med = float(np.median(values))
+        mad = float(np.median(np.abs(values - med)))
+        if mad <= 1e-6:
+            return float(np.mean(values))
+        mask = np.abs(values - med) <= (3.0 * mad)
+        if int(np.sum(mask)) == 0:
+            return med
+        return float(np.mean(values[mask]))
+
+    @staticmethod
     def _estimate_sample_fps(valid_timestamps: np.ndarray, fallback_fps: float) -> float:
         if len(valid_timestamps) < 3:
             return fallback_fps
@@ -121,9 +160,11 @@ class CPRAnalyzer:
     def _bandpass_filter(self, signal: np.ndarray, sample_fps: float) -> np.ndarray:
         if sample_fps <= 0:
             return signal
+        low_hz = max(self.bp_low, self.min_valid_cpm / 60.0, 0.3)
+        high_hz = min(self.bp_high, self.max_valid_cpm / 60.0, 3.0)
         nyq = 0.5 * sample_fps
-        low = max(self.bp_low / nyq, 1e-4)
-        high = min(self.bp_high / nyq, 0.999)
+        low = max(low_hz / nyq, 1e-4)
+        high = min(high_hz / nyq, 0.999)
         if low >= high:
             return signal
         b, a = butter(self.bp_order, [low, high], btype="band")
@@ -161,12 +202,19 @@ class CPRAnalyzer:
             self.last_valid_cpm = cpm
             self.last_valid_regularity = regularity
             self.last_valid_t = t_sec
+            self.last_hold_age_ms = 0.0
             return cpm, regularity
 
         if self.last_valid_t is None:
+            self.last_hold_age_ms = None
             return None, None
-        if (t_sec - self.last_valid_t) <= self.cpm_hold_sec:
+
+        hold_age_ms = (t_sec - self.last_valid_t) * 1000.0
+        if hold_age_ms <= (self.cpm_hold_sec * 1000.0):
+            self.last_hold_age_ms = hold_age_ms
             return self.last_valid_cpm, self.last_valid_regularity
+
+        self.last_hold_age_ms = None
         return None, None
 
     @staticmethod
@@ -203,6 +251,156 @@ class CPRAnalyzer:
         label = "good" if score >= 0.65 else "improve"
         return float(score), label
 
+    def _pose_chest_roi(self, pose_landmarks) -> Optional[tuple[float, float, float, float]]:
+        if pose_landmarks is None:
+            return None
+        lm = pose_landmarks.landmark
+        ls = lm[self.mp_pose.PoseLandmark.LEFT_SHOULDER]
+        rs = lm[self.mp_pose.PoseLandmark.RIGHT_SHOULDER]
+        lh = lm[self.mp_pose.PoseLandmark.LEFT_HIP]
+        rh = lm[self.mp_pose.PoseLandmark.RIGHT_HIP]
+        chest_x = float((ls.x + rs.x) / 2.0)
+        shoulder_y = float((ls.y + rs.y) / 2.0)
+        hip_y = float((lh.y + rh.y) / 2.0)
+        x_half = float(max(0.12, abs(ls.x - rs.x) * 1.6))
+        y_min = shoulder_y - 0.18
+        y_max = hip_y + 0.12
+        return chest_x, y_min, y_max, x_half
+
+    def _extract_hand_candidates(self, hand_result, frame_shape: tuple[int, int, int]) -> list[_HandCandidate]:
+        if not hand_result.multi_hand_landmarks:
+            return []
+        h, w = frame_shape[:2]
+        candidates: list[_HandCandidate] = []
+        for hand in hand_result.multi_hand_landmarks:
+            coords = np.array([(lm.x, lm.y) for lm in hand.landmark], dtype=np.float32)
+            coords = np.clip(coords, 0.0, 1.0)
+            palm = coords[_PALM_INDICES]
+            palm_y = self._robust_mean(palm[:, 1])
+            wrist = coords[0]
+            wrist_y = float(wrist[1])
+
+            if self.hand_signal_mode == "wrist":
+                signal_y = wrist_y
+                anchor_norm = (float(wrist[0]), float(wrist[1]))
+                track_pts_norm = coords[[0, 5, 9]]
+            elif self.hand_signal_mode == "hybrid":
+                signal_y = float(0.7 * palm_y + 0.3 * wrist_y)
+                anchor_all = np.vstack([palm, wrist[None, :]])
+                anchor_norm = (float(np.mean(anchor_all[:, 0])), float(np.mean(anchor_all[:, 1])))
+                track_pts_norm = palm
+            else:
+                signal_y = palm_y
+                anchor_norm = (float(np.mean(palm[:, 0])), float(np.mean(palm[:, 1])))
+                track_pts_norm = palm
+
+            anchor_px = (int(anchor_norm[0] * w), int(anchor_norm[1] * h))
+            track_pts_px = np.array(
+                [[[float(pt[0] * w), float(pt[1] * h)]] for pt in track_pts_norm],
+                dtype=np.float32,
+            )
+            candidates.append(
+                _HandCandidate(
+                    signal_y=signal_y,
+                    anchor_px=anchor_px,
+                    anchor_norm=anchor_norm,
+                    track_points_px=track_pts_px,
+                )
+            )
+        return candidates
+
+    def _select_hand_candidate(self, candidates: list[_HandCandidate], pose_landmarks) -> Optional[_HandCandidate]:
+        if not candidates:
+            return None
+        chest_roi = self._pose_chest_roi(pose_landmarks) if self.enable_pose else None
+
+        best_idx = 0
+        best_score = float("inf")
+        for idx, cand in enumerate(candidates):
+            score = 0.0
+            if self.tracked_signal_y is not None:
+                score += 2.0 * abs(cand.signal_y - self.tracked_signal_y)
+
+            if chest_roi is not None:
+                chest_x, y_min, y_max, x_half = chest_roi
+                x_norm, y_norm = cand.anchor_norm
+                outside = not (y_min <= y_norm <= y_max and abs(x_norm - chest_x) <= x_half)
+                if outside:
+                    score += 1.0
+                score += 0.5 * abs(x_norm - chest_x)
+            else:
+                score += 0.1 * abs(cand.anchor_norm[0] - 0.5)
+
+            if score < best_score:
+                best_score = score
+                best_idx = idx
+        return candidates[best_idx]
+
+    def _estimate_flow_signal(
+        self, gray: np.ndarray, frame_shape: tuple[int, int, int]
+    ) -> tuple[float, Optional[tuple[int, int]], Optional[np.ndarray]]:
+        if self.prev_gray is None or self.prev_track_points is None:
+            return np.nan, None, None
+
+        next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
+            self.prev_gray,
+            gray,
+            self.prev_track_points,
+            None,
+            winSize=(21, 21),
+            maxLevel=2,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
+        )
+        if next_pts is None or status is None:
+            self.prev_track_points = None
+            return np.nan, None, None
+
+        valid = status.reshape(-1) == 1
+        if int(np.sum(valid)) < 2:
+            self.prev_track_points = None
+            return np.nan, None, None
+
+        prev_valid = self.prev_track_points[valid][:, 0, :]
+        next_valid = next_pts[valid][:, 0, :]
+        h = max(frame_shape[0], 1)
+        dy_norm = float(np.median((next_valid[:, 1] - prev_valid[:, 1]) / h))
+        base_y = (
+            self.tracked_signal_y
+            if self.tracked_signal_y is not None
+            else float(np.median(prev_valid[:, 1]) / h)
+        )
+        flow_y = float(np.clip(base_y + dy_norm, 0.0, 1.0))
+        anchor = np.median(next_valid, axis=0)
+        flow_anchor_px = (int(anchor[0]), int(anchor[1]))
+        flow_points = next_valid.reshape(-1, 1, 2).astype(np.float32)
+        return flow_y, flow_anchor_px, flow_points
+
+    def _fuse_hand_signal(
+        self,
+        gray: np.ndarray,
+        frame_shape: tuple[int, int, int],
+        candidate: Optional[_HandCandidate],
+    ) -> tuple[float, Optional[tuple[int, int]]]:
+        flow_y, flow_anchor_px, flow_points = self._estimate_flow_signal(gray, frame_shape)
+
+        if candidate is not None:
+            fused_y = candidate.signal_y
+            if not np.isnan(flow_y) and self.hand_signal_mode == "hybrid":
+                fused_y = float(0.8 * candidate.signal_y + 0.2 * flow_y)
+            fused_y = float(np.clip(fused_y, 0.0, 1.0))
+            self.tracked_signal_y = fused_y
+            self.prev_track_points = candidate.track_points_px
+            return fused_y, candidate.anchor_px
+
+        if not np.isnan(flow_y):
+            self.tracked_signal_y = flow_y
+            self.prev_track_points = flow_points
+            return flow_y, flow_anchor_px
+
+        self.tracked_signal_y = None
+        self.prev_track_points = None
+        return np.nan, None
+
     def _estimate_cpm_from_autocorr(
         self,
         signal: np.ndarray,
@@ -221,7 +419,6 @@ class CPRAnalyzer:
         lag_max = min(len(ac) - 1, int(max_interval_sec * sample_fps))
         if lag_max < lag_min:
             return None
-
         window = ac[lag_min : lag_max + 1]
         if len(window) == 0:
             return None
@@ -231,80 +428,28 @@ class CPRAnalyzer:
             return None
         return float(60.0 * sample_fps / best_lag)
 
-    def _fuse_wrist_signal(
-        self,
-        gray: np.ndarray,
-        frame_shape: tuple[int, int, int],
-        wrist_y_landmark: float,
-        wrist_px_landmark: Optional[tuple[int, int]],
-    ) -> tuple[float, Optional[tuple[int, int]]]:
-        flow_wrist_y = np.nan
-        flow_wrist_px = None
-
-        if self.prev_gray is not None and self.prev_wrist_point is not None:
-            next_pts, status, _ = cv2.calcOpticalFlowPyrLK(
-                self.prev_gray,
-                gray,
-                self.prev_wrist_point,
-                None,
-                winSize=(21, 21),
-                maxLevel=2,
-                criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03),
-            )
-            if next_pts is not None and status is not None and int(status[0][0]) == 1:
-                prev_pt = self.prev_wrist_point[0][0]
-                next_pt = next_pts[0][0]
-                dy_norm = float((next_pt[1] - prev_pt[1]) / max(frame_shape[0], 1))
-                base_y = self.tracked_wrist_y if self.tracked_wrist_y is not None else float(prev_pt[1] / frame_shape[0])
-                flow_wrist_y = float(np.clip(base_y + dy_norm, 0.0, 1.0))
-                flow_wrist_px = (int(next_pt[0]), int(next_pt[1]))
-                self.prev_wrist_point = next_pts
-            else:
-                self.prev_wrist_point = None
-
-        if not np.isnan(wrist_y_landmark):
-            self.tracked_wrist_y = float(np.clip(wrist_y_landmark, 0.0, 1.0))
-            if wrist_px_landmark is not None:
-                self.prev_wrist_point = np.array(
-                    [[[float(wrist_px_landmark[0]), float(wrist_px_landmark[1])]]], dtype=np.float32
-                )
-            return self.tracked_wrist_y, wrist_px_landmark
-
-        if not np.isnan(flow_wrist_y):
-            self.tracked_wrist_y = flow_wrist_y
-            return flow_wrist_y, flow_wrist_px
-
-        self.tracked_wrist_y = None
-        return np.nan, None
-
     def process_frame(self, frame: np.ndarray, t_sec: float) -> tuple[np.ndarray, CPRMetrics]:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         hand_result = self.hands.process(rgb)
-        if self.frame_counter % self.pose_every_n == 0:
-            pose_result = self.pose.process(rgb)
-            self._last_pose_landmarks = pose_result.pose_landmarks
-        pose_landmarks = self._last_pose_landmarks
+        for hand in hand_result.multi_hand_landmarks or []:
+            self.mp_draw.draw_landmarks(frame, hand, self.mp_hands.HAND_CONNECTIONS)
 
-        wrist_y_landmark = np.nan
-        wrist_px_landmark = None
-        if hand_result.multi_hand_landmarks:
-            ys = []
-            pxs = []
-            for hand in hand_result.multi_hand_landmarks:
-                self.mp_draw.draw_landmarks(frame, hand, self.mp_hands.HAND_CONNECTIONS)
-                lm = hand.landmark[self.mp_hands.HandLandmark.WRIST]
-                ys.append(lm.y)
-                pxs.append((int(lm.x * frame.shape[1]), int(lm.y * frame.shape[0])))
-            wrist_y_landmark = float(np.mean(ys))
-            wrist_px_landmark = pxs[0]
+        pose_landmarks = None
+        if self.enable_pose:
+            if self.frame_counter % self.pose_every_n == 0:
+                pose_result = self.pose.process(rgb)
+                self._last_pose_landmarks = pose_result.pose_landmarks
+            pose_landmarks = self._last_pose_landmarks
+            if pose_landmarks:
+                self.mp_draw.draw_landmarks(frame, pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
 
-        wrist_y, wrist_px = self._fuse_wrist_signal(gray, frame.shape, wrist_y_landmark, wrist_px_landmark)
-        if pose_landmarks:
-            self.mp_draw.draw_landmarks(frame, pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
+        candidates = self._extract_hand_candidates(hand_result, frame.shape)
+        selected = self._select_hand_candidate(candidates, pose_landmarks)
+        signal_y, signal_anchor_px = self._fuse_hand_signal(gray, frame.shape, selected)
 
-        self.y_positions.append(wrist_y)
+        self.y_positions.append(signal_y)
         self.timestamps.append(t_sec)
         if len(self.y_positions) > self.max_hist_samples:
             self.y_positions = self.y_positions[-self.max_hist_samples :]
@@ -318,6 +463,9 @@ class CPRAnalyzer:
         regularity: Optional[float] = None
         signal_value: Optional[float] = None
         is_peak = False
+        sample_fps_est: Optional[float] = None
+        valid_intervals_count = 0
+        signal_confidence: Optional[float] = None
 
         valid_count = int(np.sum(valid))
         if valid_count >= 3:
@@ -325,6 +473,7 @@ class CPRAnalyzer:
             valid_values = y_arr[valid]
             if (valid_times[-1] - valid_times[0]) >= 0.8:
                 sample_fps = self._estimate_sample_fps(valid_times, self.fps)
+                sample_fps_est = sample_fps
                 t_uniform = np.arange(valid_times[0], valid_times[-1] + (0.5 / sample_fps), 1.0 / sample_fps)
                 if len(t_uniform) >= 3:
                     y_interp = np.interp(t_uniform, valid_times, valid_values)
@@ -354,9 +503,10 @@ class CPRAnalyzer:
                                 valid_intervals = intervals[
                                     (intervals >= min_interval_sec) & (intervals <= max_interval_sec)
                                 ]
-                                if len(valid_intervals) > 0:
+                                valid_intervals_count = int(len(valid_intervals))
+                                if valid_intervals_count > 0:
                                     cpm_peak = float(60.0 / np.median(valid_intervals))
-                                    if len(valid_intervals) >= 2 and np.mean(valid_intervals) > 0:
+                                    if valid_intervals_count >= 2 and np.mean(valid_intervals) > 0:
                                         regularity = float(
                                             max(0.0, 1.0 - (np.std(valid_intervals) / np.mean(valid_intervals)))
                                         )
@@ -375,22 +525,32 @@ class CPRAnalyzer:
                                 s_live, sample_fps, min_interval_sec=min_interval_sec, max_interval_sec=max_interval_sec
                             )
 
-                            candidates = [
-                                c for c in (cpm_peak, cpm_ac) if c is not None and self.min_valid_cpm <= c <= self.max_valid_cpm
+                            candidates_cpm = [
+                                c
+                                for c in (cpm_peak, cpm_ac)
+                                if c is not None and self.min_valid_cpm <= c <= self.max_valid_cpm
                             ]
-                            if len(candidates) > 0:
+                            if len(candidates_cpm) > 0:
                                 if self.last_valid_cpm is not None:
-                                    cpm_raw = min(candidates, key=lambda x: abs(x - self.last_valid_cpm))
+                                    cpm_raw = min(candidates_cpm, key=lambda x: abs(x - self.last_valid_cpm))
                                 elif cpm_peak is not None:
                                     cpm_raw = cpm_peak
                                 else:
-                                    cpm_raw = candidates[0]
+                                    cpm_raw = candidates_cpm[0]
 
                                 if self._cpm_ema is None:
                                     self._cpm_ema = cpm_raw
                                 else:
                                     self._cpm_ema = (1.0 - self._cpm_alpha) * self._cpm_ema + self._cpm_alpha * cpm_raw
                                 cpm = float(self._cpm_ema)
+
+                            conf = 0.0
+                            if cpm_peak is not None:
+                                conf += 0.55
+                            if cpm_ac is not None:
+                                conf += 0.30
+                            conf += min(0.15, 0.03 * valid_intervals_count)
+                            signal_confidence = float(min(1.0, conf))
 
                             if self.enable_ventilation_detection and len(s_live) >= 3:
                                 troughs, _ = find_peaks(-s_live, distance=max(min_dist, 1), prominence=self.prominence)
@@ -404,7 +564,11 @@ class CPRAnalyzer:
 
         cpm, regularity = self._apply_cpm_hold(cpm, regularity, t_sec)
 
-        posture_score, posture_label = self._posture_from_pose(pose_landmarks)
+        if self.enable_pose:
+            posture_score, posture_label = self._posture_from_pose(pose_landmarks)
+        else:
+            posture_score, posture_label = None, "pose-off"
+
         compression_count = len(self.peak_times_global)
         ventilation_count = len(self.vent_times)
 
@@ -416,8 +580,8 @@ class CPRAnalyzer:
                 regularity = None
                 signal_value = None
 
-        if is_peak and wrist_px is not None:
-            cv2.circle(frame, wrist_px, 8, (0, 255, 0), -1)
+        if is_peak and signal_anchor_px is not None:
+            cv2.circle(frame, signal_anchor_px, 8, (0, 255, 0), -1)
 
         self.prev_gray = gray
         self.frame_counter += 1
@@ -433,5 +597,9 @@ class CPRAnalyzer:
             ratio_30_2_score=ratio_score_30_2(compression_count, ventilation_count),
             in_ventilation_pause=in_ventilation_pause,
             signal_value=signal_value,
+            sample_fps_est=sample_fps_est,
+            valid_intervals=valid_intervals_count,
+            signal_confidence=signal_confidence,
+            hold_age_ms=self.last_hold_age_ms,
         )
         return frame, metrics
