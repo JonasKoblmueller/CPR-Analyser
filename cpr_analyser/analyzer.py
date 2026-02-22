@@ -45,7 +45,13 @@ class _HandCandidate:
 
 
 class CPRAnalyzer:
-    """Frame-based CPR analyzer using MediaPipe Hands + optional Pose."""
+    """Frame-basierter CPR-Analyzer.
+
+    Signalidee:
+    - Aus Hand-Landmarks (bevorzugt Palm-Center) wird ein vertikales Bewegungssignal gewonnen.
+    - Optical Flow stabilisiert das Signal bei kurzen Landmark-Aussetzern.
+    - Aus dem zeitbasierten Signal wird die CPR-Frequenz (CPM) geschaetzt.
+    """
 
     def __init__(
         self,
@@ -268,6 +274,13 @@ class CPRAnalyzer:
         return chest_x, y_min, y_max, x_half
 
     def _extract_hand_candidates(self, hand_result, frame_shape: tuple[int, int, int]) -> list[_HandCandidate]:
+        """Erzeugt pro erkannter Hand einen Kandidaten fuer die Signalgewinnung.
+
+        Je nach Modus wird als Signal verwendet:
+        - `wrist`: Landmark 0
+        - `palm`: Mittelwert aus Handflaechenpunkten (robuster)
+        - `hybrid`: Mischung aus Palm + Wrist
+        """
         if not hand_result.multi_hand_landmarks:
             return []
         h, w = frame_shape[:2]
@@ -310,6 +323,13 @@ class CPRAnalyzer:
         return candidates
 
     def _select_hand_candidate(self, candidates: list[_HandCandidate], pose_landmarks) -> Optional[_HandCandidate]:
+        """Waehlt die plausibelste Hand fuer die CPR-Auswertung aus.
+
+        Prioritaet:
+        1. zeitliche Stabilitaet (naehe zum zuletzt verfolgten Signal)
+        2. optional Pose-ROI im Brustbereich
+        3. leichter Bildmittelpunkt-Bias als Fallback
+        """
         if not candidates:
             return None
         chest_roi = self._pose_chest_roi(pose_landmarks) if self.enable_pose else None
@@ -339,6 +359,13 @@ class CPRAnalyzer:
     def _estimate_flow_signal(
         self, gray: np.ndarray, frame_shape: tuple[int, int, int]
     ) -> tuple[float, Optional[tuple[int, int]], Optional[np.ndarray]]:
+        """Schaetzt die Handbewegung ueber Optical Flow (LK) zwischen zwei Frames.
+
+        Rueckgabe:
+        - `flow_y`: normierte vertikale Signalposition (0..1) oder NaN
+        - `flow_anchor_px`: Pixelpunkt fuer Visualisierung
+        - `flow_points`: neue Trackingpunkte fuer den naechsten Frame
+        """
         if self.prev_gray is None or self.prev_track_points is None:
             return np.nan, None, None
 
@@ -381,6 +408,13 @@ class CPRAnalyzer:
         frame_shape: tuple[int, int, int],
         candidate: Optional[_HandCandidate],
     ) -> tuple[float, Optional[tuple[int, int]]]:
+        """Fusioniert Landmark-Signal mit Optical Flow.
+
+        Strategie:
+        - Landmark hat Prioritaet (wenn vorhanden)
+        - im `hybrid`-Modus wird Flow leicht beigemischt
+        - bei Landmark-Ausfall wird nur Flow verwendet
+        """
         flow_y, flow_anchor_px, flow_points = self._estimate_flow_signal(gray, frame_shape)
 
         if candidate is not None:
@@ -408,6 +442,7 @@ class CPRAnalyzer:
         min_interval_sec: float,
         max_interval_sec: float,
     ) -> Optional[float]:
+        """Autokorrelations-basierte CPR-Frequenzschaetzung als Fallback/Second Opinion."""
         if len(signal) < 8 or sample_fps <= 0:
             return None
         centered = signal - np.mean(signal)
@@ -429,15 +464,23 @@ class CPRAnalyzer:
         return float(60.0 * sample_fps / best_lag)
 
     def process_frame(self, frame: np.ndarray, t_sec: float) -> tuple[np.ndarray, CPRMetrics]:
+        """Analysiert ein einzelnes Frame und liefert annotiertes Bild + Metriken.
+
+        `t_sec` muss die echte Zeitachse des Videos/Live-Streams repraesentieren.
+        Dadurch bleibt die CPM-Schaetzung unabhaengig von UI-FPS oder Scheduler-Jitter.
+        """
+        # Vorverarbeitung fuer MediaPipe (RGB) und Optical Flow (Graustufen).
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+        # Hand-Landmarks fuer Primaersignal.
         hand_result = self.hands.process(rgb)
         for hand in hand_result.multi_hand_landmarks or []:
             self.mp_draw.draw_landmarks(frame, hand, self.mp_hands.HAND_CONNECTIONS)
 
         pose_landmarks = None
         if self.enable_pose:
+            # Pose wird absichtlich seltener gerechnet, um Rechenzeit zu sparen.
             if self.frame_counter % self.pose_every_n == 0:
                 pose_result = self.pose.process(rgb)
                 self._last_pose_landmarks = pose_result.pose_landmarks
@@ -445,10 +488,12 @@ class CPRAnalyzer:
             if pose_landmarks:
                 self.mp_draw.draw_landmarks(frame, pose_landmarks, self.mp_pose.POSE_CONNECTIONS)
 
+        # Handsignal aus Landmarks + Optical Flow zusammensetzen.
         candidates = self._extract_hand_candidates(hand_result, frame.shape)
         selected = self._select_hand_candidate(candidates, pose_landmarks)
         signal_y, signal_anchor_px = self._fuse_hand_signal(gray, frame.shape, selected)
 
+        # Historie begrenzen -> konstante Rechenlast auch bei langen Videos.
         self.y_positions.append(signal_y)
         self.timestamps.append(t_sec)
         if len(self.y_positions) > self.max_hist_samples:
@@ -472,11 +517,14 @@ class CPRAnalyzer:
             valid_times = t_arr[valid]
             valid_values = y_arr[valid]
             if (valid_times[-1] - valid_times[0]) >= 0.8:
+                # Effektive Samplerate aus echten Zeitstempeln schaetzen (nicht aus UI-FPS).
                 sample_fps = self._estimate_sample_fps(valid_times, self.fps)
                 sample_fps_est = sample_fps
+                # Zeitbasiertes Resampling auf gleichmaessige Zeitachse fuer Filter/Peaks.
                 t_uniform = np.arange(valid_times[0], valid_times[-1] + (0.5 / sample_fps), 1.0 / sample_fps)
                 if len(t_uniform) >= 3:
                     y_interp = np.interp(t_uniform, valid_times, valid_values)
+                    # Vorzeichen drehen: Kompressionsrichtung soll "Peaks" ergeben.
                     signal = -y_interp
                     signal -= np.mean(signal)
                     signal = self._bandpass_filter(signal, sample_fps)
@@ -484,6 +532,7 @@ class CPRAnalyzer:
                     signal, t_uniform = self._sync_signal_and_time_lengths(signal, t_uniform)
 
                     if len(signal) >= 3 and len(t_uniform) >= 3:
+                        # Nur aktuelles Zeitfenster fuer Live-Anzeige/Frequenz verwenden.
                         mask = t_uniform > (t_uniform[-1] - self.live_window_sec)
                         t_live = t_uniform[mask]
                         s_live = signal[mask]
@@ -492,6 +541,7 @@ class CPRAnalyzer:
                             signal_value = float(s_live[-1])
 
                         if len(t_live) >= 3 and len(s_live) >= 3:
+                            # CPR-Intervallgrenzen werden direkt aus BPM-Limits abgeleitet.
                             min_interval_sec = 60.0 / self.max_valid_cpm
                             max_interval_sec = 60.0 / self.min_valid_cpm
                             min_dist = int(max(self.min_peak_distance_sec, min_interval_sec) * sample_fps)
@@ -499,6 +549,7 @@ class CPRAnalyzer:
 
                             cpm_peak: Optional[float] = None
                             if len(peaks) >= 2:
+                                # Peak-basierte Schaetzung aus echten Zeitabstaenden.
                                 intervals = np.diff(t_live[peaks])
                                 valid_intervals = intervals[
                                     (intervals >= min_interval_sec) & (intervals <= max_interval_sec)
@@ -521,10 +572,12 @@ class CPRAnalyzer:
                                         self.peak_times_global.append(ptf)
                                         last_global = ptf
 
+                            # Zweite, unabhaengige Schaetzung: Autokorrelation.
                             cpm_ac = self._estimate_cpm_from_autocorr(
                                 s_live, sample_fps, min_interval_sec=min_interval_sec, max_interval_sec=max_interval_sec
                             )
 
+                            # Kandidaten fusionieren und an letztem stabilen Wert orientieren.
                             candidates_cpm = [
                                 c
                                 for c in (cpm_peak, cpm_ac)
@@ -544,6 +597,7 @@ class CPRAnalyzer:
                                     self._cpm_ema = (1.0 - self._cpm_alpha) * self._cpm_ema + self._cpm_alpha * cpm_raw
                                 cpm = float(self._cpm_ema)
 
+                            # Einfache Konfidenz (heuristisch) fuer Debugging/Diagnose.
                             conf = 0.0
                             if cpm_peak is not None:
                                 conf += 0.55
@@ -581,6 +635,7 @@ class CPRAnalyzer:
                 signal_value = None
 
         if is_peak and signal_anchor_px is not None:
+            # Markiert den aktuell erkannten Peak im Bild.
             cv2.circle(frame, signal_anchor_px, 8, (0, 255, 0), -1)
 
         self.prev_gray = gray
