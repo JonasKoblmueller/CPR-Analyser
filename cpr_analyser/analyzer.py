@@ -12,7 +12,7 @@ from scipy.signal import butter, filtfilt, find_peaks
 
 from cpr_analyser.metrics import rate_quality_label, ratio_score_30_2
 
-HandSignalMode = Literal["palm", "wrist", "hybrid"]
+HandSignalMode = Literal["palm", "wrist"]
 _PALM_INDICES = np.array([0, 5, 9, 13, 17], dtype=int)
 
 
@@ -89,7 +89,7 @@ class CPRAnalyzer:
         self.display_debug = display_debug
 
         mode = hand_signal_mode.strip().lower()
-        self.hand_signal_mode: HandSignalMode = "palm" if mode not in {"palm", "wrist", "hybrid"} else mode
+        self.hand_signal_mode: HandSignalMode = "palm" if mode not in {"palm", "wrist"} else mode
 
         self.max_hist_sec = live_window_sec + 2.0
         self.max_hist_samples = max(1, int(self.max_hist_sec * self.fps))
@@ -279,7 +279,6 @@ class CPRAnalyzer:
         Je nach Modus wird als Signal verwendet:
         - `wrist`: Landmark 0
         - `palm`: Mittelwert aus Handflaechenpunkten (robuster)
-        - `hybrid`: Mischung aus Palm + Wrist
         """
         if not hand_result.multi_hand_landmarks:
             return []
@@ -297,11 +296,6 @@ class CPRAnalyzer:
                 signal_y = wrist_y
                 anchor_norm = (float(wrist[0]), float(wrist[1]))
                 track_pts_norm = coords[[0, 5, 9]]
-            elif self.hand_signal_mode == "hybrid":
-                signal_y = float(0.7 * palm_y + 0.3 * wrist_y)
-                anchor_all = np.vstack([palm, wrist[None, :]])
-                anchor_norm = (float(np.mean(anchor_all[:, 0])), float(np.mean(anchor_all[:, 1])))
-                track_pts_norm = palm
             else:
                 signal_y = palm_y
                 anchor_norm = (float(np.mean(palm[:, 0])), float(np.mean(palm[:, 1])))
@@ -412,15 +406,12 @@ class CPRAnalyzer:
 
         Strategie:
         - Landmark hat Prioritaet (wenn vorhanden)
-        - im `hybrid`-Modus wird Flow leicht beigemischt
         - bei Landmark-Ausfall wird nur Flow verwendet
         """
         flow_y, flow_anchor_px, flow_points = self._estimate_flow_signal(gray, frame_shape)
 
         if candidate is not None:
             fused_y = candidate.signal_y
-            if not np.isnan(flow_y) and self.hand_signal_mode == "hybrid":
-                fused_y = float(0.8 * candidate.signal_y + 0.2 * flow_y)
             fused_y = float(np.clip(fused_y, 0.0, 1.0))
             self.tracked_signal_y = fused_y
             self.prev_track_points = candidate.track_points_px

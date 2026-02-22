@@ -191,7 +191,7 @@ with st.sidebar:
 
     st.header("Signal")
     prominence = st.slider("Peak-Prominenz", min_value=0.001, max_value=0.02, value=0.003, step=0.001)
-    signal_source_label = st.selectbox("Signalquelle", ["Palm-Center", "Wrist-0", "Hybrid"], index=0)
+    signal_source_label = st.selectbox("Signalquelle", ["Palm-Center", "Wrist-0"], index=0)
     pose_active = st.checkbox("Pose aktiv", value=False)
 
     st.header("Anzeige")
@@ -218,7 +218,7 @@ with st.sidebar:
 # -----------------------------
 # UI-Elemente
 # -----------------------------
-signal_mode_map = {"Palm-Center": "palm", "Wrist-0": "wrist", "Hybrid": "hybrid"}
+signal_mode_map = {"Palm-Center": "palm", "Wrist-0": "wrist"}
 hand_signal_mode = signal_mode_map[signal_source_label]
 
 video_ph = st.empty()
