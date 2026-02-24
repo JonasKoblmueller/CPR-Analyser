@@ -241,9 +241,14 @@ def render_metrics(metrics: CPRMetrics) -> None:
     reg_ph.metric("Regelmaessigkeit", "--" if metrics.regularity is None else f"{metrics.regularity:.2f}")
     comp_ph.metric("Kompressionen", metrics.compression_count)
     vent_ph.metric("Beatmungen (aus)", "--")
-    status_ph.caption(
-        f"Rate-Qualitaet: {metrics.compression_quality} | Haltung: {metrics.posture_label}"
-        f" ({'--' if metrics.posture_score is None else f'{metrics.posture_score:.2f}'})"
+    status_ph.markdown(
+        (
+            "<div style='font-size:1.05rem; font-weight:600;'>"
+            f"Rate-Qualitaet: {metrics.compression_quality} | Haltung: {metrics.posture_label}"
+            f" ({'--' if metrics.posture_score is None else f'{metrics.posture_score:.2f}'})"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
     )
 
     if metrics.cpm is None:
